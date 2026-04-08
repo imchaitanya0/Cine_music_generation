@@ -7,74 +7,92 @@ import os
 class CineEmotionDataset(Dataset):
     """
     Advanced Dataset handler for Screenplay-to-Music data.
-    Takes raw scene JSONs containing utterance and narrative data
-    and tokenizes them flawlessly for DeBERTa-v3 using explicit 
-    structural tokens [SPK] to solve the domain-gap limitation.
+    Parses a DIRECTORY of Movie JSONs, extracting the `annotations` (scenes)
+    and formatting them into the 4D Tensor required by the Mamba/Scene Pooler architecture:
+    [num_scenes, num_utterances, seq_length]
     """
-    def __init__(self, data_path, max_length=128, tokenizer_name="microsoft/deberta-v3-base"):
-        self.max_length = max_length
+    def __init__(self, data_dir, limit=None, max_scenes=20, max_utts=15, max_len=128, tokenizer_name="microsoft/deberta-v3-base"):
+        self.max_scenes = max_scenes
+        self.max_utts = max_utts
+        self.max_len = max_len
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         
-        # We add Special Tokens so the attention heads explicitly know
-        # what is a speaker name vs what is spoken dialog.
-        # This fixes the issue noted in the pdf where sarcasm was lost.
+        # Add Special Structural Tokens
         special_tokens_dict = {'additional_special_tokens': ['[SCENE]', '[SPK]', '[TXT]', '[ACT]']}
         self.tokenizer.add_special_tokens(special_tokens_dict)
         
-        self.data_path = data_path
-        self.data = self._load_data()
+        self.data_dir = data_dir
         
-    def _load_data(self):
-        """
-        Loads the data. If the file doesn't exist yet (since we are building
-        from absolute scratch), we return an empty list gracefully so the 
-        code doesn't crash during testing.
-        """
-        if not os.path.exists(self.data_path):
-            print(f"⚠️ Warning: Dataset not found at {self.data_path}. Creating an empty dataset placeholder.")
-            return []
-            
-        with open(self.data_path, 'r') as f:
-            return json.load(f)
-
+        # Grab all JSONs and limit them to save Kaggle training time
+        if not os.path.exists(self.data_dir):
+            print(f"⚠️ Warning: Dataset dir not found at {self.data_dir}.")
+            self.files = []
+        else:
+            self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.json')]
+            if limit:
+                self.files = self.files[:limit]
+                print(f"Restricting dataset to {limit} files for testing.")
+        
     def __len__(self):
-        # We ensure a minimum length of 1 for dummy testing if empty
-        return len(self.data) if len(self.data) > 0 else 1
+        return len(self.files) if len(self.files) > 0 else 1
 
     def __getitem__(self, idx):
-        # If testing with no data yet, provide a dummy tensor 
-        if len(self.data) == 0:
-            formatted_text = "[SPK] Dummy: [TXT] This is a test."
-            label = 0
-        else:
-            item = self.data[idx]
-            speaker = item.get("speaker", "UNKNOWN")
-            text = item.get("text", "")
-            label = item.get("emotion_label", 0)
+        # Return Dummy Tensors if checking math without files
+        if len(self.files) == 0:
+            return {
+                "input_ids": torch.randint(0, 1000, (self.max_scenes, self.max_utts, self.max_len)),
+                "attention_mask": torch.ones((self.max_scenes, self.max_utts, self.max_len)),
+                "tension_level": torch.rand(self.max_scenes, 1),
+                "harmony": torch.randint(0, 7, (self.max_scenes,))
+            }
             
-            # Forcing structural hierarchy
-            formatted_text = f"[SPK] {speaker} [TXT] {text}"
+        file_path = self.files[idx]
+        with open(file_path, 'r') as f:
+            movie_data = json.load(f)
             
-        encoded = self.tokenizer(
-            formatted_text,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
+        annotations = movie_data.get("annotations", [])
         
+        # Truncate to max_scenes
+        annotations = annotations[:self.max_scenes]
+        
+        # Initialize Tensors
+        input_ids = torch.zeros((self.max_scenes, self.max_utts, self.max_len), dtype=torch.long)
+        attention_mask = torch.zeros((self.max_scenes, self.max_utts, self.max_len), dtype=torch.float)
+        tension_levels = torch.zeros((self.max_scenes, 1), dtype=torch.float)
+        harmony_labels = torch.zeros((self.max_scenes,), dtype=torch.long)
+        
+        for s_idx, scene in enumerate(annotations):
+            # Map Continuous Label
+            tension_levels[s_idx, 0] = float(scene.get("tension_level", 0.0)) / 10.0 # Normalize 0-1
+            
+            # Simulated Map of Categorical Harmony
+            h_style = scene.get("harmonic_style", "diatonic")
+            harmony_labels[s_idx] = 1 if h_style == "chromatic" else 0
+            
+            # Simple text split to simulate utterances
+            raw_text = scene.get("scene_text", "")
+            utterances = [u for u in raw_text.split('\n\n') if len(u.strip()) > 0]
+            utterances = utterances[:self.max_utts]
+            
+            for u_idx, utt in enumerate(utterances):
+                encoded = self.tokenizer(
+                    utt,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=self.max_len,
+                    return_tensors="pt"
+                )
+                input_ids[s_idx, u_idx] = encoded["input_ids"].squeeze(0)
+                attention_mask[s_idx, u_idx] = encoded["attention_mask"].squeeze(0)
+                
         return {
-            "input_ids": encoded["input_ids"].squeeze(0),
-            "attention_mask": encoded["attention_mask"].squeeze(0),
-            "labels": torch.tensor(label, dtype=torch.long)
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "tension_level": tension_levels,
+            "harmony": harmony_labels
         }
 
-def process_and_get_loaders(data_path, batch_size=16, max_length=128):
-    """
-    Factory function invoked by our training loop to get train/val loaders.
-    """
-    dataset = CineEmotionDataset(data_path=data_path, max_length=max_length)
-    
-    # In a real environment, you'd split into train/val datasets here
+def process_and_get_loaders(data_dir, batch_size=4, limit=None):
+    dataset = CineEmotionDataset(data_dir=data_dir, limit=limit)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
     return loader, dataset.tokenizer
