@@ -12,11 +12,16 @@ hardware:
   gradient_accumulation_steps: 4
 
 module1_encoder:
-  model_name: "microsoft/deberta-v3-base"
+  model_name: "microsoft/deberta-v3-large"  # Upgraded for best results
   max_length: 128
-  batch_size: 16  # Effective BS = 16 * 4 = 64
-  learning_rate: 2.0e-5
-  weight_decay: 0.01
+  batch_size: 8  # Effective BS = 8 * 4 = 32 due to larger model
+  learning_rate: 1.0e-4  # Higher LR for LoRA
+  weight_decay: 0.05
+  use_lora: true
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+  label_smoothing: 0.1
 
 module2_3_narrative:
   scene_max_utterances: 64
